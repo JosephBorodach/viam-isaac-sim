@@ -770,7 +770,7 @@ class IsaacArmHandle(ArmHandle):
             vels = self._art.get_joint_velocities()
             if vels is None:
                 return False
-            return bool(max(abs(float(v)) for v in vels) > 1e-3)
+            return bool(max(abs(float(v)) for v in vels) > 1e-2)
 
         return self._sim.run(_check)
 
