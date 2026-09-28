@@ -91,6 +91,7 @@ class IsaacArm(Arm, EasyResource):
         self._control_period = 1.0 / _DEFAULT_CONTROL_FREQ_HZ
         self._max_step_rad = math.radians(_DEFAULT_MAX_STEP_DEG)
         self._kinematics: Optional[Tuple[KinematicsFileFormat.ValueType, bytes]] = None
+        self._moving_count = 0
 
     @classmethod
     def new(
@@ -159,19 +160,23 @@ class IsaacArm(Arm, EasyResource):
     ) -> None:
         targets = [math.radians(v) for v in positions.values]
         handle = self._h()
-        await asyncio.to_thread(handle.set_joint_targets, targets)
+        self._moving_count += 1
+        try:
+            await asyncio.to_thread(handle.set_joint_targets, targets)
 
-        deadline = time.monotonic() + self._move_timeout
-        while time.monotonic() < deadline:
-            current = await asyncio.to_thread(handle.get_joint_positions)
-            if len(current) >= len(targets) and all(
-                abs(c - t) <= self._tolerance_rad for c, t in zip(current, targets)
-            ):
-                return
-            await asyncio.sleep(0.05)
-        raise TimeoutError(
-            f"arm {self.name} did not reach target within {self._move_timeout}s"
-        )
+            deadline = time.monotonic() + self._move_timeout
+            while time.monotonic() < deadline:
+                current = await asyncio.to_thread(handle.get_joint_positions)
+                if len(current) >= len(targets) and all(
+                    abs(c - t) <= self._tolerance_rad for c, t in zip(current, targets)
+                ):
+                    return
+                await asyncio.sleep(0.05)
+            raise TimeoutError(
+                f"arm {self.name} did not reach target within {self._move_timeout}s"
+            )
+        finally:
+            self._moving_count -= 1
 
     async def move_through_joint_positions(
         self, positions: Sequence[JointPositions], *args, **kwargs
@@ -185,40 +190,44 @@ class IsaacArm(Arm, EasyResource):
         if not raw:
             return
 
-        start = await asyncio.to_thread(handle.get_joint_positions)
-        stream = _densify(start, raw, self._max_step_rad)
+        self._moving_count += 1
+        try:
+            start = await asyncio.to_thread(handle.get_joint_positions)
+            stream = _densify(start, raw, self._max_step_rad)
 
-        loop = asyncio.get_running_loop()
-        push_start = loop.time()
-        for i, targets in enumerate(stream):
-            await asyncio.to_thread(handle.set_joint_targets, targets)
-            target_time = push_start + (i + 1) * self._control_period
-            sleep_needed = target_time - loop.time()
-            if sleep_needed > 0:
-                await asyncio.sleep(sleep_needed)
+            loop = asyncio.get_running_loop()
+            push_start = loop.time()
+            for i, targets in enumerate(stream):
+                await asyncio.to_thread(handle.set_joint_targets, targets)
+                target_time = push_start + (i + 1) * self._control_period
+                sleep_needed = target_time - loop.time()
+                if sleep_needed > 0:
+                    await asyncio.sleep(sleep_needed)
 
-        final_targets = raw[-1]
-        deadline = loop.time() + self._move_timeout
-        current: List[float] = []
-        while loop.time() < deadline:
-            current = await asyncio.to_thread(handle.get_joint_positions)
-            if len(current) >= len(final_targets) and all(
-                abs(c - t) <= self._tolerance_rad
-                for c, t in zip(current, final_targets)
-            ):
-                return
-            await asyncio.sleep(0.05)
+            final_targets = raw[-1]
+            deadline = loop.time() + self._move_timeout
+            current: List[float] = []
+            while loop.time() < deadline:
+                current = await asyncio.to_thread(handle.get_joint_positions)
+                if len(current) >= len(final_targets) and all(
+                    abs(c - t) <= self._tolerance_rad
+                    for c, t in zip(current, final_targets)
+                ):
+                    return
+                await asyncio.sleep(0.05)
 
-        detail = ", ".join(
-            f"j{j}: at {math.degrees(c):.1f} want {math.degrees(t):.1f}"
-            for j, (c, t) in enumerate(zip(current, final_targets))
-            if abs(c - t) > self._tolerance_rad
-        )
-        raise TimeoutError(
-            f"arm {self.name} did not converge on final waypoint "
-            f"{len(raw)}/{len(raw)} within {self._move_timeout}s "
-            f"(stuck joints: {detail})"
-        )
+            detail = ", ".join(
+                f"j{j}: at {math.degrees(c):.1f} want {math.degrees(t):.1f}"
+                for j, (c, t) in enumerate(zip(current, final_targets))
+                if abs(c - t) > self._tolerance_rad
+            )
+            raise TimeoutError(
+                f"arm {self.name} did not converge on final waypoint "
+                f"{len(raw)}/{len(raw)} within {self._move_timeout}s "
+                f"(stuck joints: {detail})"
+            )
+        finally:
+            self._moving_count -= 1
 
     async def get_joint_positions(self, **kwargs) -> JointPositions:
         radians = await asyncio.to_thread(self._h().get_joint_positions)
@@ -228,7 +237,8 @@ class IsaacArm(Arm, EasyResource):
         await asyncio.to_thread(self._h().stop)
 
     async def is_moving(self) -> bool:
-        return await asyncio.to_thread(self._h().is_moving)
+        """True while a MoveTo* RPC is in flight."""
+        return self._moving_count > 0
 
     def _kinematics_url(self) -> Optional[str]:
         url = self._attrs.get("kinematics_url")
